@@ -41,14 +41,14 @@ def send_telegram(headline, summary, symbol, source, url, ts):
         "headline": headline,
         "summary": summary,
         "symbol": symbol,
-        n8n_payload = {
-            "headline": headline,
-            "summary": summary,
-            "symbol": symbol,
-            "source": source,
-            "url": url,
-            "timestamp": ts,
-        }
+       n8n_payload = {
+        "headline": headline,
+        "summary": summary,
+        "symbol": symbol,
+        "source": source,
+        "url": url,
+        "timestamp": ts,
+    }
     }
     try:
         r = requests.post(WEBHOOK_URL, json=n8n_payload, timeout=10)
