@@ -1,3 +1,2 @@
-your-repository/
-├── main.py
-└── requirements.txt
+requests==2.32.5
+websocket-client==1.8.0
