@@ -437,8 +437,12 @@ def handle_item(ws, item):
         return
 
     # 5. Drop noise
-if route == "DROP":
-    print("DROP:", headline[:90])
+    # 5. Drop noise
+    if route == "DROP":
+        print("DROP:", headline[:90])
+
+    # 6. Structured payload for n8n
+    payload = {
    
     # 6. Structured payload for n8n
     payload = {
