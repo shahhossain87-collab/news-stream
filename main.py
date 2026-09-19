@@ -571,28 +571,3 @@ if __name__ == "__main__":
         print("WARNING: WEBHOOK_URL is not configured")
 
     run()
-if __name__ == "__main__":
-    print("Starting Fast Catalyst Alpaca Stream V2.2")
-    print("MAX_AGE_SEC =", MAX_AGE_SEC)
-
-    print(
-        "ALPACA_KEY loaded:",
-        bool(ALPACA_KEY),
-        "length:",
-        len(ALPACA_KEY),
-    )
-
-    print(
-        "ALPACA_SECRET loaded:",
-        bool(ALPACA_SECRET),
-        "length:",
-        len(ALPACA_SECRET),
-    )
-
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        raise SystemExit("Missing ALPACA_KEY or ALPACA_SECRET")
-
-    if not WEBHOOK_URL:
-        print("WARNING: WEBHOOK_URL is not configured")
-
-    run()
