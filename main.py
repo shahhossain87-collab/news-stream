@@ -9,10 +9,6 @@ import requests
 import websocket
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 ALPACA_KEY = os.environ.get("ALPACA_KEY", "").strip()
 ALPACA_SECRET = os.environ.get("ALPACA_SECRET", "").strip()
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
@@ -21,13 +17,12 @@ MAX_AGE_SEC = int(os.environ.get("MAX_AGE_SEC", "900"))
 ALLOW_MISSING_TIMESTAMP = (
     os.environ.get("ALLOW_MISSING_TIMESTAMP", "false").strip().lower() == "true"
 )
+TEST_SEND_ALL = (
+    os.environ.get("TEST_SEND_ALL", "true").strip().lower() == "true"
+)
 
 WS_URL = "wss://stream.data.alpaca.markets/v1beta1/news"
 
-
-# ============================================================
-# CATALYST TAXONOMY
-# ============================================================
 
 HIGH = [
     "fda approves",
@@ -148,6 +143,9 @@ RECAP = [
     "daily wrap",
     "morning roundup",
     "afternoon roundup",
+    "bulls and bears",
+    "couldn't stop buzzing",
+    "couldnt stop buzzing",
 ]
 
 STOPWORDS = {
@@ -156,10 +154,6 @@ STOPWORDS = {
     "corporation", "ltd", "co", "plc", "update", "says", "said",
 }
 
-
-# ============================================================
-# TTL DEDUP CACHE
-# ============================================================
 
 class TtlSet:
     def __init__(self, ttl=3600, maxlen=4000):
@@ -170,38 +164,25 @@ class TtlSet:
     def cleanup(self):
         now = time.time()
         cutoff = now - self.ttl
-
-        expired = [
-            key
-            for key, timestamp in self.data.items()
-            if timestamp <= cutoff
-        ]
-
+        expired = [key for key, timestamp in self.data.items() if timestamp <= cutoff]
         for key in expired:
             self.data.pop(key, None)
-
         if len(self.data) > self.maxlen:
             oldest = sorted(self.data.items(), key=lambda x: x[1])
             remove_count = len(self.data) - self.maxlen
-
             for key, _ in oldest[:remove_count]:
                 self.data.pop(key, None)
 
     def add_if_new(self, key):
         if not key:
             return True
-
         now = time.time()
         old = self.data.get(key)
-
         if old is not None and (now - old) < self.ttl:
             return False
-
         self.data[key] = now
-
         if len(self.data) > self.maxlen:
             self.cleanup()
-
         return True
 
 
@@ -209,18 +190,12 @@ seen_ids = TtlSet(ttl=6 * 3600, maxlen=6000)
 seen_events = TtlSet(ttl=3 * 3600, maxlen=5000)
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
 def as_symbol(value):
     if isinstance(value, list):
         parts = [str(x).upper().strip() for x in value if x]
         return ",".join(parts)
-
     if value:
         return str(value).upper().strip()
-
     return ""
 
 
@@ -232,13 +207,10 @@ def primary_symbol(value):
 def parse_ts(value):
     if not value:
         return None
-
     try:
         dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-
         return dt
     except Exception:
         return None
@@ -246,23 +218,15 @@ def parse_ts(value):
 
 def age_seconds(created_at):
     dt = parse_ts(created_at)
-
     if not dt:
         return None
-
     return (datetime.now(timezone.utc) - dt).total_seconds()
 
 
 def norm_headline(text):
     text = (text or "").lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
-
-    words = [
-        word
-        for word in text.split()
-        if word and word not in STOPWORDS
-    ]
-
+    words = [word for word in text.split() if word and word not in STOPWORDS]
     return " ".join(words[:12])
 
 
@@ -278,85 +242,45 @@ def match_any(text, phrases):
     for phrase in phrases:
         if phrase in text:
             return phrase
-
     return None
 
 
 def classify(headline, summary):
     text = f"{headline or ''} {summary or ''}".lower()
-
     recap_hit = match_any(text, RECAP)
     high_hit = match_any(text, HIGH)
     medium_hit = match_any(text, MEDIUM)
     low_hit = match_any(text, LOW)
-
     if high_hit:
         return "RESEARCH", "HIGH", high_hit
-
     if recap_hit:
         return "DROP", "LOW", recap_hit
-
     if medium_hit:
         return "WATCH", "MEDIUM", medium_hit
-
     if low_hit:
         return "WATCH", "LOW", low_hit
-
     return "DROP", "LOW", None
 
-
-# ============================================================
-# WEBHOOK DELIVERY
-# ============================================================
 
 def send_webhook(payload):
     if not WEBHOOK_URL:
         print("NO_WEBHOOK:", payload.get("headline", "")[:90])
         return False
+    try:
+        response = requests.post(WEBHOOK_URL, json=payload, timeout=8)
+        response.raise_for_status()
+        print(
+            "WEBHOOK_OK",
+            response.status_code,
+            payload.get("route"),
+            payload.get("primary_symbol"),
+            payload.get("headline", "")[:70],
+        )
+        return True
+    except requests.RequestException as exc:
+        print("WEBHOOK_FAIL:", exc)
+        return False
 
-    delays = [0, 2, 5]
-
-    for attempt, delay in enumerate(delays, start=1):
-        if delay:
-            time.sleep(delay)
-
-        try:
-            response = requests.post(
-                WEBHOOK_URL,
-                json=payload,
-                timeout=10,
-            )
-
-            response.raise_for_status()
-
-            print(
-                "WEBHOOK_OK",
-                response.status_code,
-                payload.get("route"),
-                payload.get("primary_symbol"),
-                payload.get("headline", "")[:70],
-            )
-
-            return True
-
-        except requests.RequestException as exc:
-            print(
-                f"WEBHOOK_FAIL attempt={attempt}/{len(delays)}:",
-                exc,
-            )
-
-    print(
-        "WEBHOOK_GAVE_UP:",
-        payload.get("primary_symbol"),
-        payload.get("headline", "")[:90],
-    )
-
-    return False
-
-
-# ============================================================
-# ALPACA MESSAGE HANDLING
-# ============================================================
 
 def handle_item(ws, item):
     if not isinstance(item, dict):
@@ -367,17 +291,12 @@ def handle_item(ws, item):
 
     if kind == "success":
         print("SERVER_SUCCESS:", msg)
-
-        # Authentication is done during the WebSocket handshake
-        # using APCA-API-KEY-ID / APCA-API-SECRET-KEY headers.
-        # Wait for Alpaca to confirm authentication before subscribing.
         if msg == "authenticated":
             ws.send(json.dumps({
                 "action": "subscribe",
                 "news": ["*"],
             }))
             print("SUBSCRIBE_SENT")
-
         return
 
     if kind == "subscription":
@@ -402,9 +321,7 @@ def handle_item(ws, item):
     source = item.get("source") or "alpaca"
     url = item.get("url") or ""
 
-    # 1. Freshness check
     age = age_seconds(created_at)
-
     if age is None:
         if not ALLOW_MISSING_TIMESTAMP:
             print("DROP_NO_TIMESTAMP:", headline[:90])
@@ -412,46 +329,31 @@ def handle_item(ws, item):
     else:
         if age < -60:
             print("CLOCK_WARNING:", int(age), headline[:90])
-
-        if age > MAX_AGE_SEC:
+        if age > MAX_AGE_SEC and not TEST_SEND_ALL:
             print("STALE:", int(age), "sec:", headline[:90])
             return
 
-    # 2. Exact Alpaca news ID dedup
     if news_id and not seen_ids.add_if_new("id:" + news_id):
         print("DUP_ID:", headline[:90])
         return
 
-    # 3. Catalyst classification
     route, impact, matched = classify(headline, summary)
 
-    # 4. Approximate event dedup
-    event_key = fingerprint(
-        symbols,
-        headline,
-        matched or "none",
-    )
-
+    event_key = fingerprint(symbols, headline, matched or "none")
     if not seen_events.add_if_new(event_key):
         print("DUP_EVENT:", headline[:90])
         return
 
-    # 5. Drop noise
-    # 5. Drop noise
     if route == "DROP":
         print("DROP:", headline[:90])
 
-    # 6. Structured payload for n8n
     payload = {
-   
-    # 6. Structured payload for n8n
-    payload = {
-        "schema_version": "2.2",
+        "schema_version": "2.3",
         "route": route,
         "impact": impact,
         "matched": matched,
         "headline": headline,
-        "summary": summary[:500],
+        "summary": (summary or "")[:500],
         "symbol": as_symbol(symbols),
         "primary_symbol": primary_symbol(symbols),
         "source": source,
@@ -462,25 +364,14 @@ def handle_item(ws, item):
         "news_id": news_id,
         "event_fingerprint": event_key,
         "host": urlparse(url).netloc if url else "",
+        "test_send_all": TEST_SEND_ALL,
     }
 
-    print(
-        route,
-        impact,
-        payload["primary_symbol"],
-        "|",
-        matched,
-        "|",
-        headline,
-    )
+    print(route, impact, payload["primary_symbol"], "|", matched, "|", headline)
 
-    # 7. Send only WATCH / RESEARCH events downstream
-    send_webhook(payload)
+    if TEST_SEND_ALL or route in ("WATCH", "RESEARCH"):
+        send_webhook(payload)
 
-
-# ============================================================
-# WEBSOCKET CALLBACKS
-# ============================================================
 
 def on_message(ws, message):
     try:
@@ -488,7 +379,6 @@ def on_message(ws, message):
     except Exception as exc:
         print("BAD_JSON:", exc)
         return
-
     if isinstance(data, list):
         for item in data:
             handle_item(ws, item)
@@ -508,22 +398,14 @@ def on_close(ws, close_code, close_msg):
     print("WS_CLOSED:", close_code, close_msg)
 
 
-# ============================================================
-# CONNECTION LOOP
-# ============================================================
-
 def run():
     reconnect_delay = 2
-
     while True:
         try:
-            # Alpaca supports authenticating during the opening
-            # WebSocket handshake using these HTTP headers.
             headers = [
                 f"APCA-API-KEY-ID: {ALPACA_KEY}",
                 f"APCA-API-SECRET-KEY: {ALPACA_SECRET}",
             ]
-
             ws = websocket.WebSocketApp(
                 WS_URL,
                 header=headers,
@@ -532,45 +414,22 @@ def run():
                 on_error=on_error,
                 on_close=on_close,
             )
-
-            ws.run_forever(
-                ping_interval=30,
-                ping_timeout=10,
-            )
-
+            ws.run_forever(ping_interval=30, ping_timeout=10)
         except Exception as exc:
             print("WS_FATAL:", exc)
-
         print(f"Reconnecting in {reconnect_delay}s...")
         time.sleep(reconnect_delay)
-
         reconnect_delay = min(reconnect_delay * 2, 30)
 
 
-# ============================================================
-# START
-# ============================================================
-
 if __name__ == "__main__":
-    print("Starting Fast Catalyst Alpaca Stream V2.2")
+    print("Starting Fast Catalyst Alpaca Stream V2.3")
     print("MAX_AGE_SEC =", MAX_AGE_SEC)
-    print(
-        "ALPACA_KEY loaded:",
-        bool(ALPACA_KEY),
-        "length:",
-        len(ALPACA_KEY),
-    )
-    print(
-        "ALPACA_SECRET loaded:",
-        bool(ALPACA_SECRET),
-        "length:",
-        len(ALPACA_SECRET),
-    )
-
+    print("TEST_SEND_ALL =", TEST_SEND_ALL)
+    print("ALPACA_KEY loaded:", bool(ALPACA_KEY), "length:", len(ALPACA_KEY))
+    print("ALPACA_SECRET loaded:", bool(ALPACA_SECRET), "length:", len(ALPACA_SECRET))
     if not ALPACA_KEY or not ALPACA_SECRET:
         raise SystemExit("Missing ALPACA_KEY or ALPACA_SECRET")
-
     if not WEBHOOK_URL:
         print("WARNING: WEBHOOK_URL is not configured")
-
     run()
