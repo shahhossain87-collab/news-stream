@@ -18,7 +18,7 @@ ALLOW_MISSING_TIMESTAMP = (
     os.environ.get("ALLOW_MISSING_TIMESTAMP", "false").strip().lower() == "true"
 )
 TEST_SEND_ALL = (
-    os.environ.get("TEST_SEND_ALL", "true").strip().lower() == "true"
+    os.environ.get("TEST_SEND_ALL", "false").strip().lower() == "true"
 )
 
 WS_URL = "wss://stream.data.alpaca.markets/v1beta1/news"
@@ -369,7 +369,12 @@ def handle_item(ws, item):
 
     print(route, impact, payload["primary_symbol"], "|", matched, "|", headline)
 
-    if TEST_SEND_ALL or route in ("WATCH", "RESEARCH"):
+    # Production gate: only qualified catalysts are forwarded downstream.
+    # WATCH and DROP events remain visible in logs for review, but do not
+    # enter the webhook-driven research/trading workflow.
+    qualified_catalyst = route == "RESEARCH" and impact == "HIGH"
+
+    if TEST_SEND_ALL or qualified_catalyst:
         send_webhook(payload)
 
 
