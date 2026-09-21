@@ -152,6 +152,34 @@ RECAP = [
     "earnings call transcript",
     "conference call transcript",
     "full transcript",
+    "market-moving news",
+    "why is ",
+    "why are ",
+]
+
+# Conservative noise filter. These patterns are commentary/calendar items, not
+# fresh company catalysts. Strong HIGH catalyst phrases still override them.
+NOISE = [
+    "earnings scheduled for",
+    "jim cramer",
+    "kevin o'leary",
+    "kevin o’leary",
+    "mad money",
+    "shark tank",
+]
+
+# Repeated macro soundbites can arrive as many separate headlines within minutes.
+# Keep the first one, then suppress near-term repeats for the same symbol/topic.
+MACRO_REPEAT_SYMBOLS = {"SPY", "QQQ", "DIA", "IWM"}
+MACRO_REPEAT_PHRASES = [
+    "fed",
+    "fomc",
+    "goolsbee",
+    "powell",
+    "inflation",
+    "interest rate",
+    "rate cuts",
+    "rate cut",
 ]
 
 STOPWORDS = {
@@ -194,6 +222,7 @@ class TtlSet:
 
 seen_ids = TtlSet(ttl=6 * 3600, maxlen=6000)
 seen_events = TtlSet(ttl=3 * 3600, maxlen=5000)
+seen_macro = TtlSet(ttl=15 * 60, maxlen=500)
 
 
 def as_symbol(value):
@@ -254,28 +283,43 @@ def match_any(text, phrases):
 def classify(headline, summary):
     text = f"{headline or ''} {summary or ''}".lower()
     recap_hit = match_any(text, RECAP)
+    noise_hit = match_any(text, NOISE)
     high_hit = match_any(text, HIGH)
     medium_hit = match_any(text, MEDIUM)
     low_hit = match_any(text, LOW)
 
-    # Recall-first design: a known strong catalyst always wins, even when the
-    # article is a recap/transcript that repeats the catalyst.
+    # A known strong catalyst always wins, even if commentary/recap wording is
+    # present in the same item. This protects recall for genuinely material news.
     if high_hit:
         return "RESEARCH", "HIGH", high_hit
 
-    # Drop only obvious recap/transcript noise when there is no HIGH catalyst.
+    # Conservative suppression: only obvious recap, calendar and personality
+    # commentary noise is dropped. Unknown company-specific wording still passes.
     if recap_hit:
         return "DROP", "LOW", recap_hit
+    if noise_hit:
+        return "DROP", "LOW", noise_hit
 
     if medium_hit:
         return "WATCH", "MEDIUM", medium_hit
     if low_hit:
         return "WATCH", "LOW", low_hit
 
-    # IMPORTANT: unknown wording is NOT dropped. Forward it as a low-confidence
-    # WATCH candidate so downstream research can decide whether it is material.
-    # This prevents exact keyword matching from silently missing real catalysts.
     return "WATCH", "LOW", "unclassified_candidate"
+
+
+def is_macro_repeat(symbols, headline, summary):
+    symbol = primary_symbol(symbols)
+    if symbol not in MACRO_REPEAT_SYMBOLS:
+        return False
+    text = f"{headline or ''} {summary or ''}".lower()
+    topic = match_any(text, MACRO_REPEAT_PHRASES)
+    if not topic:
+        return False
+    # Group all Fed/inflation soundbites for the same broad-market symbol into
+    # a 15-minute bucket. The first gets through; follow-ups are logged only.
+    key = f"macro:{symbol}:fed_inflation"
+    return not seen_macro.add_if_new(key)
 
 
 def send_webhook(payload):
@@ -355,6 +399,10 @@ def handle_item(ws, item):
 
     route, impact, matched = classify(headline, summary)
 
+    if route != "RESEARCH" and is_macro_repeat(symbols, headline, summary):
+        print("DROP_MACRO_REPEAT:", primary_symbol(symbols), headline[:90])
+        return
+
     event_key = fingerprint(symbols, headline, matched or "none")
     if not seen_events.add_if_new(event_key):
         print("DUP_EVENT:", headline[:90])
@@ -364,7 +412,7 @@ def handle_item(ws, item):
         print("DROP:", headline[:90])
 
     payload = {
-        "schema_version": "2.4",
+        "schema_version": "2.5",
         "route": route,
         "impact": impact,
         "matched": matched,
@@ -444,7 +492,7 @@ def run():
 
 
 if __name__ == "__main__":
-    print("Starting Fast Catalyst Alpaca Stream V2.4 Recall-First")
+    print("Starting Fast Catalyst Alpaca Stream V2.5 Balanced-Recall")
     print("MAX_AGE_SEC =", MAX_AGE_SEC)
     print("TEST_SEND_ALL =", TEST_SEND_ALL)
     print("ALPACA_KEY loaded:", bool(ALPACA_KEY), "length:", len(ALPACA_KEY))
