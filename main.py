@@ -21,6 +21,12 @@ TEST_SEND_ALL = (
     os.environ.get("TEST_SEND_ALL", "false").strip().lower() == "true"
 )
 
+# V3 decision-compression mode. When true, low-priority/indirect/follow-up items
+# are still logged but are not forwarded to the downstream webhook.
+ACTIONABLE_ONLY = (
+    os.environ.get("ACTIONABLE_ONLY", "false").strip().lower() == "true"
+)
+
 WS_URL = "wss://stream.data.alpaca.markets/v1beta1/news"
 
 
@@ -182,6 +188,28 @@ MACRO_REPEAT_PHRASES = [
     "rate cut",
 ]
 
+# V3 decision-compression layers. These do not replace the original catalyst
+# classifier; they qualify whether an item deserves trader attention.
+ANALYST_ROUTINE = [
+    "maintains ", "reiterates ", "reiterated ", "price target",
+]
+ANALYST_STRONG = [
+    "upgrades ", "upgraded to", "downgrades ", "downgraded to",
+    "initiates coverage", "initiated coverage",
+]
+INDIRECT_OR_SECTOR = [
+    "shares of software companies", "shares of semiconductor companies",
+    "shares of crypto-linked companies", "shares of electronic equipment",
+    "amid overall market strength", "broader rally", "sector strength",
+    "indirectly support", "indirectly benefit", "peer in",
+]
+RISK_ALERT_PHRASES = [
+    "accounting investigation", "administrative leave", "delisting notice",
+    "non-compliance notice", "going concern", "files for bankruptcy",
+    "filed for bankruptcy", "bankruptcy filing", "restatement",
+    "sec charges", "doj charges", "criminal charges",
+]
+
 STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "to", "for", "in", "on",
     "with", "after", "as", "at", "by", "from", "inc", "corp",
@@ -223,6 +251,11 @@ class TtlSet:
 seen_ids = TtlSet(ttl=6 * 3600, maxlen=6000)
 seen_events = TtlSet(ttl=3 * 3600, maxlen=5000)
 seen_macro = TtlSet(ttl=15 * 60, maxlen=500)
+
+# Lightweight event-family memory. Same-symbol/same-family headlines are marked
+# as FOLLOW_UP instead of being mistaken for independent trade ideas.
+event_clusters = {}
+EVENT_CLUSTER_TTL = 2 * 3600
 
 
 def as_symbol(value):
@@ -322,6 +355,118 @@ def is_macro_repeat(symbols, headline, summary):
     return not seen_macro.add_if_new(key)
 
 
+def event_family(headline, summary, matched=""):
+    text = f"{headline or ''} {summary or ''} {matched or ''}".lower()
+    families = [
+        ("fda_clinical", ["fda", "phase 3", "phase iii", "primary endpoint", "clinical trial"]),
+        ("guidance", ["guidance", "outlook", "forecast"]),
+        ("earnings", ["eps", "revenue", "sales", "earnings", "quarter"]),
+        ("mna", ["acquire", "acquisition", "merger", "take-private", "takeover", "hsr"]),
+        ("analyst", ["price target", "upgraded", "downgraded", "initiates coverage", "maintains", "reiterates"]),
+        ("contract", ["contract", "purchase agreement", "power purchase agreement", "awarded"]),
+        ("legal_regulatory", ["lawsuit", "settlement", "attorney general", "sec ", "doj ", "nasdaq", "delisting"]),
+        ("financing", ["offering", "convertible", "equity facility", "dilution", "buyback", "repurchase", "dividend"]),
+        ("management", ["ceo", "cfo", "coo", "president", "resigns", "appointed"]),
+        ("insider", ["insider", "form 4", "chairman bought", "ceo purchased", "cfo purchased"]),
+        ("macro", ["fed", "fomc", "inflation", "interest rate", "white house", "president trump", "bank of canada"]),
+        ("product", ["launch", "product", "demonstrate", "presentation", "abstract"]),
+    ]
+    for family, phrases in families:
+        if any(p in text for p in phrases):
+            return family
+    return "other"
+
+
+def event_cluster_status(symbols, family):
+    symbol = primary_symbol(symbols)
+    if not symbol:
+        return "NEW_EVENT"
+    now = time.time()
+    # purge old cluster timestamps opportunistically
+    expired = [k for k, ts in event_clusters.items() if (now - ts) >= EVENT_CLUSTER_TTL]
+    for key in expired:
+        event_clusters.pop(key, None)
+    key = f"{symbol}|{family}"
+    old = event_clusters.get(key)
+    event_clusters[key] = now
+    return "FOLLOW_UP" if old is not None and (now - old) < EVENT_CLUSTER_TTL else "NEW_EVENT"
+
+
+def freshness_bucket(age):
+    if age is None:
+        return "UNKNOWN"
+    if age <= 5 * 60:
+        return "FRESH"
+    if age <= 15 * 60:
+        return "EARLY"
+    if age <= 60 * 60:
+        return "AGING"
+    return "STALE"
+
+
+def directness_bucket(symbols, headline, summary):
+    symbol = primary_symbol(symbols)
+    text = f"{headline or ''} {summary or ''}".lower()
+    if symbol in MACRO_REPEAT_SYMBOLS:
+        return "MARKET_MACRO"
+    if any(p in text for p in INDIRECT_OR_SECTOR):
+        return "INDIRECT_OR_SECTOR"
+    # The news feed does not provide a reliable company-name-to-ticker mapping, so
+    # avoid claiming certainty. Downstream research can upgrade this to DIRECT.
+    return "LIKELY_DIRECT"
+
+
+def analyst_signal_quality(headline, summary):
+    text = f"{headline or ''} {summary or ''}".lower()
+    if any(p in text for p in ANALYST_STRONG):
+        return "STRONG_CHANGE"
+    if any(p in text for p in ANALYST_ROUTINE):
+        return "ROUTINE_OR_PT_ONLY"
+    return "NOT_ANALYST"
+
+
+def actionability(route, impact, family, event_status, freshness, directness, analyst_quality, headline, summary):
+    text = f"{headline or ''} {summary or ''}".lower()
+
+    if route == "DROP":
+        return "SUPPRESS", "explicit_noise_or_recap"
+
+    if any(p in text for p in RISK_ALERT_PHRASES):
+        return "RISK_ALERT", "material_negative_or_governance_risk"
+
+    if directness == "INDIRECT_OR_SECTOR":
+        return "NOT_DIRECT", "ticker_linkage_is_indirect_or_sector_level"
+
+    if family == "analyst" and analyst_quality == "ROUTINE_OR_PT_ONLY":
+        return "LOW_PRIORITY", "routine_analyst_reiteration_or_pt_change"
+
+    if event_status == "FOLLOW_UP" and impact != "HIGH":
+        return "UPDATE_ONLY", "same_symbol_same_event_family_recently_seen"
+
+    if directness == "MARKET_MACRO":
+        return "MACRO_CONTEXT", "broad_market_context_not_single_stock_entry"
+
+    if impact == "HIGH" and freshness in ("FRESH", "EARLY"):
+        return "VALIDATE_NOW", "fresh_high_impact_catalyst"
+
+    if impact == "HIGH":
+        return "RESEARCH_DEEP", "high_impact_but_not_fresh"
+
+    if impact == "MEDIUM" and freshness in ("FRESH", "EARLY"):
+        return "WATCH_SETUP", "fresh_medium_impact_candidate"
+
+    if route == "RESEARCH":
+        return "RESEARCH_DEEP", "research_candidate"
+
+    return "LOW_PRIORITY", "insufficient_edge_for_immediate_swing_action"
+
+
+def should_forward_action(action):
+    if not ACTIONABLE_ONLY:
+        return action != "SUPPRESS"
+    return action in {"VALIDATE_NOW", "WATCH_SETUP", "RESEARCH_DEEP", "RISK_ALERT", "MACRO_CONTEXT"}
+
+
 def send_webhook(payload):
     if not WEBHOOK_URL:
         print("NO_WEBHOOK:", payload.get("headline", "")[:90])
@@ -398,6 +543,15 @@ def handle_item(ws, item):
         return
 
     route, impact, matched = classify(headline, summary)
+    family = event_family(headline, summary, matched)
+    event_status = event_cluster_status(symbols, family)
+    freshness = freshness_bucket(age)
+    directness = directness_bucket(symbols, headline, summary)
+    analyst_quality = analyst_signal_quality(headline, summary)
+    action, action_reason = actionability(
+        route, impact, family, event_status, freshness, directness,
+        analyst_quality, headline, summary
+    )
 
     if route != "RESEARCH" and is_macro_repeat(symbols, headline, summary):
         print("DROP_MACRO_REPEAT:", primary_symbol(symbols), headline[:90])
@@ -412,7 +566,7 @@ def handle_item(ws, item):
         print("DROP:", headline[:90])
 
     payload = {
-        "schema_version": "2.5",
+        "schema_version": "3.0",
         "route": route,
         "impact": impact,
         "matched": matched,
@@ -427,19 +581,33 @@ def handle_item(ws, item):
         "age_sec": int(age) if age is not None else None,
         "news_id": news_id,
         "event_fingerprint": event_key,
+        "event_family": family,
+        "event_status": event_status,
+        "freshness": freshness,
+        "directness": directness,
+        "analyst_signal_quality": analyst_quality,
+        "actionability": action,
+        "action_reason": action_reason,
+        # These fields are deliberately not fabricated here. A downstream market-data
+        # step should calculate actual price movement from catalyst time before any entry.
+        "price_move_since_catalyst_pct": None,
+        "price_check_required": action in {"VALIDATE_NOW", "WATCH_SETUP", "RESEARCH_DEEP"},
+        "swing_rule": "GOOD_NEWS_IS_NOT_AN_ENTRY; validate price reaction and setup before trade",
         "host": urlparse(url).netloc if url else "",
         "test_send_all": TEST_SEND_ALL,
+        "actionable_only": ACTIONABLE_ONLY,
     }
 
-    print(route, impact, payload["primary_symbol"], "|", matched, "|", headline)
+    print(route, impact, payload["primary_symbol"], "|", action, "|", family, "|", headline)
 
-    # Recall-first production gate: forward all RESEARCH and WATCH candidates.
-    # Only explicit DROP noise is withheld. Downstream research performs the
-    # final qualification, which greatly reduces false negatives here.
-    forward_candidate = route in ("RESEARCH", "WATCH")
+    # V3 gate: by default preserve backward-compatible recall. Set ACTIONABLE_ONLY=true
+    # to forward only compressed, trader-relevant candidates.
+    forward_candidate = route in ("RESEARCH", "WATCH") and should_forward_action(action)
 
     if TEST_SEND_ALL or forward_candidate:
         send_webhook(payload)
+    else:
+        print("QUALIFIED_OUT:", action, payload["primary_symbol"], headline[:90])
 
 
 def on_message(ws, message):
@@ -492,9 +660,10 @@ def run():
 
 
 if __name__ == "__main__":
-    print("Starting Fast Catalyst Alpaca Stream V2.5 Balanced-Recall")
+    print("Starting Fast Catalyst Alpaca Stream V3.0 Decision-Compression")
     print("MAX_AGE_SEC =", MAX_AGE_SEC)
     print("TEST_SEND_ALL =", TEST_SEND_ALL)
+    print("ACTIONABLE_ONLY =", ACTIONABLE_ONLY)
     print("ALPACA_KEY loaded:", bool(ALPACA_KEY), "length:", len(ALPACA_KEY))
     print("ALPACA_SECRET loaded:", bool(ALPACA_SECRET), "length:", len(ALPACA_SECRET))
     if not ALPACA_KEY or not ALPACA_SECRET:
